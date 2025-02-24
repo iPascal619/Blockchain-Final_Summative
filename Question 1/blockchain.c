@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <openssl/evp.h>  // Include for EVP API
+#include <openssl/evp.h>  
 #include "blockchain.h"
 
 void calculateHash(JobBlock* block, char* output) {
