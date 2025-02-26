@@ -2,10 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <openssl/sha.h>
-#include <openssl/rsa.h>
-#include <openssl/pem.h>
-#include <openssl/err.h>
+#include <openssl/evp.h>     
+#include <openssl/pem.h>    
+#include <openssl/err.h>     
+
 
 // 1. System Design and Architecture - Data Structures
 
@@ -85,45 +85,92 @@ int pending_transaction_count = 0;
 
 // 2. Blockchain Cryptography Functions
 
-// Generate SHA-256 hash
+// Generate  hash
+#include <openssl/evp.h>
+
 void generate_hash(char *input, char *output) {
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256_CTX sha256;
-    SHA256_Init(&sha256);
-    SHA256_Update(&sha256, input, strlen(input));
-    SHA256_Final(hash, &sha256);
+    unsigned char hash[EVP_MAX_MD_SIZE];  
+    unsigned int hash_len = 0;
     
-    for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        sprintf(output + (i * 2), "%02x", hash[i]);
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        printf("Error: Could not create EVP_MD_CTX.\n");
+        return;
     }
-    output[64] = '\0';
+
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1 ||
+        EVP_DigestUpdate(mdctx, input, strlen(input)) != 1 ||
+        EVP_DigestFinal_ex(mdctx, hash, &hash_len) != 1) {
+        printf("Error: Hash computation failed.\n");
+        EVP_MD_CTX_free(mdctx);
+        return;
+    }
+
+    EVP_MD_CTX_free(mdctx);
+
+    for (unsigned int i = 0; i < hash_len; i++) {
+        snprintf(output + (i * 2), 3, "%02x", hash[i]);  // Prevents buffer overflow
+    }
+    output[hash_len * 2] = '\0';  
 }
+
 
 // Generate key pair for wallet
 void generate_key_pair(char *public_key, char *private_key) {
-    RSA *rsa = RSA_generate_key(2048, RSA_F4, NULL, NULL);
-    
-    // Save public key to string
-    BIO *public_bio = BIO_new(BIO_s_mem());
-    PEM_write_bio_RSAPublicKey(public_bio, rsa);
-    
-    size_t pub_len = BIO_pending(public_bio);
-    BIO_read(public_bio, public_key, pub_len);
-    public_key[pub_len] = '\0';
-    
-    // Save private key to string
-    BIO *private_bio = BIO_new(BIO_s_mem());
-    PEM_write_bio_RSAPrivateKey(private_bio, rsa, NULL, NULL, 0, NULL, NULL);
-    
-    size_t priv_len = BIO_pending(private_bio);
-    BIO_read(private_bio, private_key, priv_len);
-    private_key[priv_len] = '\0';
-    
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+
+    if (!ctx) {
+        printf("Error initializing EVP_PKEY_CTX\n");
+        EVP_PKEY_CTX_free(ctx);
+        return;
+    }
+
+    // Generate RSA key pair
+    if (EVP_PKEY_keygen_init(ctx) <= 0 || EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0 || EVP_PKEY_keygen(ctx, &pkey) <= 0) {
+        printf("Error generating RSA key pair\n");
+        EVP_PKEY_CTX_free(ctx);
+        return;
+    }
+
+    // Create BIOs to write keys into memory
+    BIO *bio_public = BIO_new(BIO_s_mem());
+    BIO *bio_private = BIO_new(BIO_s_mem());
+
+    if (!bio_public || !bio_private) {
+        printf("Error creating BIO objects\n");
+        EVP_PKEY_CTX_free(ctx);
+        return;
+    }
+
+    // Write keys to BIOs
+    PEM_write_bio_PUBKEY(bio_public, pkey);
+    PEM_write_bio_PrivateKey(bio_private, pkey, NULL, NULL, 0, NULL, NULL);
+
+    // Get the length of the public and private key data
+    size_t pub_len = BIO_pending(bio_public);
+    size_t priv_len = BIO_pending(bio_private);
+
+    // Ensure buffers are large enough
+    if (pub_len > 0 && priv_len > 0) {
+        // Read data from BIO into buffers
+        BIO_read(bio_public, public_key, pub_len);
+        BIO_read(bio_private, private_key, priv_len);
+
+        // Null-terminate the strings
+        public_key[pub_len] = '\0';
+        private_key[priv_len] = '\0';
+    } else {
+        printf("Error: Public/Private key generation failed to write data\n");
+    }
+
     // Clean up
-    BIO_free_all(public_bio);
-    BIO_free_all(private_bio);
-    RSA_free(rsa);
-}
+    BIO_free(bio_public);
+    BIO_free(bio_private);
+    EVP_PKEY_free(pkey);
+    EVP_PKEY_CTX_free(ctx);
+}   
+    
 
 // Sign transaction
 void sign_transaction(Transaction *transaction, char *private_key) {
@@ -133,29 +180,35 @@ void sign_transaction(Transaction *transaction, char *private_key) {
             transaction->receiver_address, 
             transaction->amount, 
             transaction->timestamp);
-    
-    RSA *rsa = NULL;
+
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    EVP_PKEY *pkey = NULL;
     BIO *bio = BIO_new_mem_buf(private_key, -1);
-    PEM_read_bio_RSAPrivateKey(bio, &rsa, NULL, NULL);
+
+    if (!PEM_read_bio_PrivateKey(bio, &pkey, NULL, NULL)) {
+        printf("Error reading private key\n");
+        BIO_free(bio);
+        return;
+    }
+
+    EVP_DigestSignInit(mdctx, NULL, EVP_sha256(), NULL, pkey);
+    EVP_DigestSignUpdate(mdctx, transaction_data, strlen(transaction_data));
+
+    size_t sig_len;
+    EVP_DigestSignFinal(mdctx, NULL, &sig_len);
+    unsigned char *signature = (unsigned char *)malloc(sig_len);
+
+    EVP_DigestSignFinal(mdctx, signature, &sig_len);
     
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256_CTX sha256;
-    SHA256_Init(&sha256);
-    SHA256_Update(&sha256, transaction_data, strlen(transaction_data));
-    SHA256_Final(hash, &sha256);
-    
-    unsigned char signature[256];
-    unsigned int signature_len;
-    RSA_sign(NID_sha256, hash, SHA256_DIGEST_LENGTH, signature, &signature_len, rsa);
-    
-    // Convert binary signature to hex string
-    for(unsigned int i = 0; i < signature_len; i++) {
+    for(size_t i = 0; i < sig_len; i++) {
         sprintf(transaction->signature + (i * 2), "%02x", signature[i]);
     }
-    
+
     // Clean up
-    BIO_free_all(bio);
-    RSA_free(rsa);
+    free(signature);
+    EVP_MD_CTX_free(mdctx);
+    EVP_PKEY_free(pkey);
+    BIO_free(bio);
 }
 
 // Verify transaction signature
@@ -166,44 +219,37 @@ int verify_transaction(Transaction *transaction) {
             transaction->receiver_address, 
             transaction->amount, 
             transaction->timestamp);
-    
-    // Find sender's wallet to get public key
-    char *public_key = NULL;
-    for(int i = 0; i < wallet_count; i++) {
-        if(strcmp(wallets[i]->address, transaction->sender_address) == 0) {
-            public_key = wallets[i]->public_key;
-            break;
-        }
+
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    EVP_PKEY *pkey = NULL;
+    BIO *bio = BIO_new_mem_buf(transaction->sender_address, -1); // Use sender's public key
+
+    if (!PEM_read_bio_PUBKEY(bio, &pkey, NULL, NULL)) {
+        printf("Error reading public key\n");
+        BIO_free(bio);
+        return 0;
     }
-    
-    if(public_key == NULL) {
-        return 0; // Sender not found
-    }
-    
-    RSA *rsa = NULL;
-    BIO *bio = BIO_new_mem_buf(public_key, -1);
-    PEM_read_bio_RSAPublicKey(bio, &rsa, NULL, NULL);
-    
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256_CTX sha256;
-    SHA256_Init(&sha256);
-    SHA256_Update(&sha256, transaction_data, strlen(transaction_data));
-    SHA256_Final(hash, &sha256);
-    
-    // Convert hex signature back to binary
+
+    EVP_DigestVerifyInit(mdctx, NULL, EVP_sha256(), NULL, pkey);
+    EVP_DigestVerifyUpdate(mdctx, transaction_data, strlen(transaction_data));
+
+    // Convert signature from hex to binary
     unsigned char signature[256];
-    for(int i = 0; i < 128; i++) {
+    size_t sig_len = strlen(transaction->signature) / 2;
+    for (size_t i = 0; i < sig_len; i++) {
         sscanf(transaction->signature + (i * 2), "%02hhx", &signature[i]);
     }
-    
-    int result = RSA_verify(NID_sha256, hash, SHA256_DIGEST_LENGTH, signature, 128, rsa);
-    
+
+    int result = EVP_DigestVerifyFinal(mdctx, signature, sig_len);
+
     // Clean up
-    BIO_free_all(bio);
-    RSA_free(rsa);
-    
-    return result;
+    EVP_MD_CTX_free(mdctx);
+    EVP_PKEY_free(pkey);
+    BIO_free(bio);
+
+    return result == 1; // Returns 1 if valid, 0 if invalid
 }
+
 
 // 3. Consensus Mechanism Functions
 
